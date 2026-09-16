@@ -220,6 +220,13 @@ func loadStackOptional(cfg *config.Config, branch string) (*loadStackResult, err
 		cfg.Errorf("not a git repository")
 		return nil, fmt.Errorf("not a git repository")
 	}
+	if git.UsingDefaultOps() {
+		gitDir, err = git.CommonDir()
+		if err != nil {
+			cfg.Errorf("failed to find shared git directory: %s", err)
+			return nil, fmt.Errorf("failed to find shared git directory: %w", err)
+		}
+	}
 
 	sf, err := stack.Load(gitDir)
 	if err != nil {
@@ -886,6 +893,62 @@ func fastForwardBranches(cfg *config.Config, s *stack.Stack, remote, currentBran
 	return updated
 }
 
+// fastForwardWorktreeBranches fast-forwards checked-out branches in their
+// owning worktrees. Branches without owners retain the ordinary checkout flow.
+func fastForwardWorktreeBranches(cfg *config.Config, s *stack.Stack, remote, currentBranch string, worktrees map[string]string) []string {
+	var updated []string
+	for _, br := range s.Branches {
+		if br.IsSkipped() {
+			continue
+		}
+		refs, err := git.RevParseMulti([]string{br.Branch, remote + "/" + br.Branch})
+		if err != nil || refs[0] == refs[1] {
+			continue
+		}
+		isAncestor, err := git.IsAncestor(refs[0], refs[1])
+		if err != nil || !isAncestor {
+			continue
+		}
+		if path := worktrees[br.Branch]; path != "" {
+			if err := git.MergeFFAt(path, remote+"/"+br.Branch); err != nil {
+				cfg.Warningf("Failed to fast-forward %s from remote: %v", br.Branch, err)
+				continue
+			}
+		} else if currentBranch == br.Branch {
+			if err := git.MergeFF(remote + "/" + br.Branch); err != nil {
+				cfg.Warningf("Failed to fast-forward %s from remote: %v", br.Branch, err)
+				continue
+			}
+		} else if err := git.UpdateBranchRef(br.Branch, refs[1]); err != nil {
+			cfg.Warningf("Failed to fast-forward %s from remote: %v", br.Branch, err)
+			continue
+		}
+		cfg.Successf("Fast-forwarded %s to %s", br.Branch, short(refs[1]))
+		updated = append(updated, br.Branch)
+	}
+	return updated
+}
+
+func restoreRebaseRefsAt(cfg *config.Config, originalRefs, worktrees map[string]string, branches []string) {
+	for _, branch := range branches {
+		sha := originalRefs[branch]
+		path := worktrees[branch]
+		if path != "" {
+			if err := git.ResetHardAt(path, sha); err != nil {
+				cfg.Warningf("Failed to restore %s in %s: %v", branch, path, err)
+			}
+			continue
+		}
+		if err := git.CheckoutBranch(branch); err != nil {
+			cfg.Warningf("Failed to restore %s: %v", branch, err)
+			continue
+		}
+		if err := git.ResetHard(sha); err != nil {
+			cfg.Warningf("Failed to restore %s: %v", branch, err)
+		}
+	}
+}
+
 // resolveOriginalRefs builds a map from branch name to current SHA for all
 // branches in the stack. Merged branches that no longer exist locally are
 // backfilled from the stack metadata. This map is used as the "before" state
@@ -970,6 +1033,10 @@ func (t trunkTarget) Describe() string {
 // cascade must use. Updating the local trunk is best-effort; the fetched remote
 // ref remains the source of truth when the local branch is stale or immovable.
 func resolveTrunkTarget(cfg *config.Config, s *stack.Stack, remote, currentBranch string) (trunkTarget, error) {
+	return resolveTrunkTargetInWorktree(cfg, s, remote, currentBranch, "")
+}
+
+func resolveTrunkTargetInWorktree(cfg *config.Config, s *stack.Stack, remote, currentBranch, trunkWorktree string) (trunkTarget, error) {
 	normalizeStackTrunk(cfg, s, remote)
 	trunk := s.Trunk.Branch
 	remoteRef := remote + "/" + trunk
@@ -1011,7 +1078,9 @@ func resolveTrunkTarget(cfg *config.Config, s *stack.Stack, remote, currentBranc
 	canFastForward, ffErr := git.IsAncestor(localSHA, remoteSHA)
 	if ffErr == nil && canFastForward {
 		var updateErr error
-		if currentBranch == trunk {
+		if trunkWorktree != "" {
+			updateErr = git.MergeFFAt(trunkWorktree, remoteRef)
+		} else if currentBranch == trunk {
 			updateErr = git.MergeFF(remoteRef)
 		} else {
 			updateErr = git.UpdateBranchRef(trunk, remoteSHA)
@@ -1069,6 +1138,8 @@ type cascadeRebaseOpts struct {
 	OntoOldBase               string
 	CommitterDateIsAuthorDate bool
 	TrunkRef                  string
+	Worktrees                 map[string]string
+	WorktreeMode              bool
 }
 
 func (o cascadeRebaseOpts) trunkRef() string {
@@ -1109,15 +1180,16 @@ func resolveRebaseOldBase(currentParentTip, recordedBase, newBase, branch string
 
 // cascadeRebaseResult describes the outcome of a cascade rebase.
 type cascadeRebaseResult struct {
-	Rebased        bool     // at least one branch was successfully rebased
-	Conflicted     bool     // a rebase conflict was detected (recoverable via --continue)
-	Err            error    // a fatal error occurred (not recoverable via --continue)
-	ConflictIdx    int      // absolute index in Stack.Branches of the conflicting branch
-	ConflictBranch string   // name of the conflicting branch
-	ConflictBase   string   // base branch we were rebasing onto
-	Remaining      []string // branch names after the conflict point
-	NeedsOnto      bool     // --onto state at the conflict point (for --continue)
-	OntoOldBase    string   // ontoOldBase at the conflict point (for --continue)
+	Rebased         bool     // at least one branch was successfully rebased
+	RebasedBranches []string // successfully rebased branch names
+	Conflicted      bool     // a rebase conflict was detected (recoverable via --continue)
+	Err             error    // a fatal error occurred (not recoverable via --continue)
+	ConflictIdx     int      // absolute index in Stack.Branches of the conflicting branch
+	ConflictBranch  string   // name of the conflicting branch
+	ConflictBase    string   // base branch we were rebasing onto
+	Remaining       []string // branch names after the conflict point
+	NeedsOnto       bool     // --onto state at the conflict point (for --continue)
+	OntoOldBase     string   // ontoOldBase at the conflict point (for --continue)
 }
 
 // cascadeRebase performs a cascade rebase across the given branch range. It
@@ -1130,7 +1202,7 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 	ontoOldBase := opts.OntoOldBase
 	originalRefs := opts.OriginalRefs
 	result := cascadeRebaseResult{}
-	rebaseOpts := git.RebaseOpts{CommitterDateIsAuthorDate: opts.CommitterDateIsAuthorDate}
+	rebaseOpts := git.RebaseOpts{CommitterDateIsAuthorDate: opts.CommitterDateIsAuthorDate, NoUpdateRefs: opts.WorktreeMode}
 	trunkRef := opts.trunkRef()
 
 	for i, br := range opts.Branches {
@@ -1142,6 +1214,7 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 		} else {
 			base = s.Branches[absIdx-1].Branch
 		}
+		worktree := opts.Worktrees[br.Branch]
 
 		// Skip merged and queued branches — but treat them differently for
 		// downstream rebasing.
@@ -1178,16 +1251,24 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 			actualOldBase, err := resolveRebaseOldBase(ontoOldBase, br.Base, newBase, br.Branch)
 			if err != nil {
 				return cascadeRebaseResult{
-					Rebased: result.Rebased,
-					Err:     err,
+					Rebased:         result.Rebased,
+					RebasedBranches: result.RebasedBranches,
+					Err:             err,
 				}
 			}
 
-			if err := git.RebaseOnto(newBase, actualOldBase, br.Branch, rebaseOpts); err != nil {
-				if git.IsRebaseStartError(err) {
+			var rebaseErr error
+			if worktree != "" {
+				rebaseErr = git.RebaseOntoAt(worktree, newBase, actualOldBase, rebaseOpts)
+			} else {
+				rebaseErr = git.RebaseOnto(newBase, actualOldBase, br.Branch, rebaseOpts)
+			}
+			if rebaseErr != nil {
+				if git.IsRebaseStartError(rebaseErr) {
 					return cascadeRebaseResult{
-						Rebased: result.Rebased,
-						Err:     fmt.Errorf("could not start rebase of %s onto %s: %w", br.Branch, newBase, err),
+						Rebased:         result.Rebased,
+						RebasedBranches: result.RebasedBranches,
+						Err:             fmt.Errorf("could not start rebase of %s onto %s: %w", br.Branch, newBase, rebaseErr),
 					}
 				}
 				remaining := make([]string, 0, len(opts.Branches)-i-1)
@@ -1195,19 +1276,21 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 					remaining = append(remaining, opts.Branches[j].Branch)
 				}
 				return cascadeRebaseResult{
-					Rebased:        result.Rebased,
-					Conflicted:     true,
-					ConflictIdx:    absIdx,
-					ConflictBranch: br.Branch,
-					ConflictBase:   newBase,
-					Remaining:      remaining,
-					NeedsOnto:      true,
-					OntoOldBase:    originalRefs[br.Branch],
+					Rebased:         result.Rebased,
+					RebasedBranches: result.RebasedBranches,
+					Conflicted:      true,
+					ConflictIdx:     absIdx,
+					ConflictBranch:  br.Branch,
+					ConflictBase:    newBase,
+					Remaining:       remaining,
+					NeedsOnto:       true,
+					OntoOldBase:     originalRefs[br.Branch],
 				}
 			}
 
 			cfg.Successf("Rebased %s onto %s (adjusted for merged PR)", br.Branch, newBase)
 			result.Rebased = true
+			result.RebasedBranches = append(result.RebasedBranches, br.Branch)
 			ontoOldBase = originalRefs[br.Branch]
 		} else {
 			var rebaseErr error
@@ -1215,26 +1298,36 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 				oldBase, err := resolveRebaseOldBase(originalRefs[base], br.Base, base, br.Branch)
 				if err != nil {
 					return cascadeRebaseResult{
-						Rebased: result.Rebased,
-						Err:     err,
+						Rebased:         result.Rebased,
+						RebasedBranches: result.RebasedBranches,
+						Err:             err,
 					}
 				}
-				rebaseErr = git.RebaseOnto(base, oldBase, br.Branch, rebaseOpts)
+				if worktree != "" {
+					rebaseErr = git.RebaseOntoAt(worktree, base, oldBase, rebaseOpts)
+				} else {
+					rebaseErr = git.RebaseOnto(base, oldBase, br.Branch, rebaseOpts)
+				}
 			} else {
-				if err := git.CheckoutBranch(br.Branch); err != nil {
+				if worktree != "" {
+					rebaseErr = git.RebaseAt(worktree, base, rebaseOpts)
+				} else if err := git.CheckoutBranch(br.Branch); err != nil {
 					return cascadeRebaseResult{
-						Rebased: result.Rebased,
-						Err:     fmt.Errorf("checking out %s: %w", br.Branch, err),
+						Rebased:         result.Rebased,
+						RebasedBranches: result.RebasedBranches,
+						Err:             fmt.Errorf("checking out %s: %w", br.Branch, err),
 					}
+				} else {
+					rebaseErr = git.Rebase(base, rebaseOpts)
 				}
-				rebaseErr = git.Rebase(base, rebaseOpts)
 			}
 
 			if rebaseErr != nil {
 				if git.IsRebaseStartError(rebaseErr) {
 					return cascadeRebaseResult{
-						Rebased: result.Rebased,
-						Err:     fmt.Errorf("could not start rebase of %s onto %s: %w", br.Branch, base, rebaseErr),
+						Rebased:         result.Rebased,
+						RebasedBranches: result.RebasedBranches,
+						Err:             fmt.Errorf("could not start rebase of %s onto %s: %w", br.Branch, base, rebaseErr),
 					}
 				}
 				remaining := make([]string, 0, len(opts.Branches)-i-1)
@@ -1242,19 +1335,21 @@ func cascadeRebase(opts cascadeRebaseOpts) cascadeRebaseResult {
 					remaining = append(remaining, opts.Branches[j].Branch)
 				}
 				return cascadeRebaseResult{
-					Rebased:        result.Rebased,
-					Conflicted:     true,
-					ConflictIdx:    absIdx,
-					ConflictBranch: br.Branch,
-					ConflictBase:   base,
-					Remaining:      remaining,
-					NeedsOnto:      false,
-					OntoOldBase:    originalRefs[br.Branch],
+					Rebased:         result.Rebased,
+					RebasedBranches: result.RebasedBranches,
+					Conflicted:      true,
+					ConflictIdx:     absIdx,
+					ConflictBranch:  br.Branch,
+					ConflictBase:    base,
+					Remaining:       remaining,
+					NeedsOnto:       false,
+					OntoOldBase:     originalRefs[br.Branch],
 				}
 			}
 
 			cfg.Successf("Rebased %s onto %s", br.Branch, base)
 			result.Rebased = true
+			result.RebasedBranches = append(result.RebasedBranches, br.Branch)
 		}
 	}
 

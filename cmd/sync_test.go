@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1291,6 +1292,222 @@ func TestSync_Prune_DeletesMergedBranches(t *testing.T) {
 	assert.Equal(t, []string{"origin/b1"}, deletedTrackingRefs, "should delete remote-tracking ref for pruned branch")
 	assert.Contains(t, output, "Pruned b1 (merged)")
 	assert.Contains(t, output, "Pruned 1 merged branch")
+}
+
+func TestSync_WorktreesFlag(t *testing.T) {
+	cfg, _, _ := config.NewTestConfig()
+	cmd := SyncCmd(cfg)
+	flag := cmd.Flags().Lookup("worktrees")
+	require.NotNil(t, flag)
+	assert.Equal(t, "w", flag.Shorthand)
+	assert.Equal(t, "false", flag.DefValue)
+}
+
+func TestIntegration_SyncWorktrees_RebasesAndPushesThreeLayerStack(t *testing.T) {
+	repo := setupSyncWorktreeRepo(t, false)
+
+	withIssue250Repo(t, repo.b2Dir)
+	cfg := issue250TestConfig(t)
+	require.NoError(t, runSync(cfg, &syncOptions{remote: "origin", worktrees: true}))
+
+	for _, pair := range [][2]string{{"main", "b1"}, {"b1", "b2"}, {"b2", "b3"}} {
+		require.NoError(t, issue250GitMayFail(t, repo.cloneDir, "merge-base", "--is-ancestor", pair[0], pair[1]))
+	}
+	for _, branch := range []string{"b1", "b2", "b3"} {
+		assert.Equal(t, issue250Git(t, repo.cloneDir, "rev-parse", branch), issue250Git(t, repo.remoteDir, "rev-parse", branch), "%s must be pushed", branch)
+	}
+	assert.Equal(t, "main", issue250Git(t, repo.cloneDir, "branch", "--show-current"))
+	assert.Equal(t, "b1", issue250Git(t, repo.b1Dir, "branch", "--show-current"))
+	assert.Equal(t, "b2", issue250Git(t, repo.b2Dir, "branch", "--show-current"))
+	assert.Equal(t, "b3", issue250Git(t, repo.b3Dir, "branch", "--show-current"))
+}
+
+func TestIntegration_SyncWithoutWorktrees_ExplainsRequiredFlag(t *testing.T) {
+	repo := setupSyncWorktreeRepo(t, false)
+	b1Before := issue250Git(t, repo.cloneDir, "rev-parse", "b1")
+
+	withIssue250Repo(t, repo.b2Dir)
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{}
+	t.Cleanup(func() {
+		_ = cfg.Out.Close()
+		_ = cfg.Err.Close()
+		_ = errR.Close()
+	})
+	err := runSync(cfg, &syncOptions{remote: "origin"})
+	require.ErrorIs(t, err, ErrSilent)
+	cfg.Err.Close()
+	output, _ := io.ReadAll(errR)
+
+	assert.Contains(t, string(output), "gh stack sync --worktrees")
+	assert.Equal(t, b1Before, issue250Git(t, repo.cloneDir, "rev-parse", "b1"))
+}
+
+func TestIntegration_SyncWorktreesConflict_RestoresRefsAndDoesNotPush(t *testing.T) {
+	repo := setupSyncWorktreeRepo(t, true)
+	originalRefs := map[string]string{}
+	remoteRefs := map[string]string{}
+	for _, branch := range []string{"b1", "b2", "b3"} {
+		originalRefs[branch] = issue250Git(t, repo.cloneDir, "rev-parse", branch)
+		remoteRefs[branch] = issue250Git(t, repo.remoteDir, "rev-parse", branch)
+	}
+	b3ReflogBefore := issue250Git(t, repo.cloneDir, "reflog", "--format=%H", "b3")
+
+	withIssue250Repo(t, repo.b2Dir)
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{}
+	t.Cleanup(func() {
+		_ = cfg.Out.Close()
+		_ = cfg.Err.Close()
+		_ = errR.Close()
+	})
+	err := runSync(cfg, &syncOptions{remote: "origin", worktrees: true})
+	require.ErrorIs(t, err, ErrConflict)
+	cfg.Err.Close()
+	output, _ := io.ReadAll(errR)
+
+	assert.Contains(t, string(output), "gh stack rebase --worktrees")
+	assert.False(t, git.IsRebaseInProgressAt(repo.b2Dir), "the owning worktree rebase must be aborted")
+	for branch, sha := range originalRefs {
+		assert.Equal(t, sha, issue250Git(t, repo.cloneDir, "rev-parse", branch), "%s must be restored", branch)
+		assert.Equal(t, remoteRefs[branch], issue250Git(t, repo.remoteDir, "rev-parse", branch), "%s must not be pushed", branch)
+	}
+	assert.Equal(t, b3ReflogBefore, issue250Git(t, repo.cloneDir, "reflog", "--format=%H", "b3"), "an unrebase branch must not be reset during rollback")
+}
+
+func TestIntegration_SyncWorktreesDirtyWorktreeStopsBeforeRefsChange(t *testing.T) {
+	repo := setupSyncWorktreeRepo(t, false)
+	originalRefs := map[string]string{}
+	for _, branch := range []string{"main", "b1", "b2", "b3"} {
+		originalRefs[branch] = issue250Git(t, repo.cloneDir, "rev-parse", branch)
+	}
+	issue250WriteFile(t, repo.b1Dir, "dirty.txt", "uncommitted\n")
+
+	withIssue250Repo(t, repo.b2Dir)
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{}
+	t.Cleanup(func() {
+		_ = cfg.Out.Close()
+		_ = cfg.Err.Close()
+		_ = errR.Close()
+	})
+	err := runSync(cfg, &syncOptions{remote: "origin", worktrees: true})
+	require.ErrorIs(t, err, ErrSilent)
+	cfg.Err.Close()
+	output, _ := io.ReadAll(errR)
+
+	assert.Contains(t, string(output), "it has staged, unstaged, or untracked changes")
+	for branch, sha := range originalRefs {
+		assert.Equal(t, sha, issue250Git(t, repo.cloneDir, "rev-parse", branch), "%s must not change after preflight fails", branch)
+	}
+	assert.Contains(t, issue250Git(t, repo.b1Dir, "status", "--porcelain"), "?? dirty.txt")
+}
+
+func TestIntegration_SyncWorktreesPruneSkipsOccupiedMergedBranch(t *testing.T) {
+	repo := setupSyncWorktreeRepo(t, false)
+	issue250Git(t, repo.cloneDir, "checkout", "main")
+	issue250Git(t, repo.cloneDir, "branch", "merged-unoccupied")
+	issue250Git(t, repo.cloneDir, "push", "origin", "merged-unoccupied")
+	issue250Git(t, repo.cloneDir, "branch", "merged-occupied")
+	issue250Git(t, repo.cloneDir, "push", "origin", "merged-occupied")
+	occupiedDir := filepath.Join(t.TempDir(), "merged-occupied")
+	issue250Git(t, repo.cloneDir, "worktree", "add", occupiedDir, "merged-occupied")
+
+	gitDir := filepath.Join(repo.cloneDir, ".git")
+	sf, err := stack.Load(gitDir)
+	require.NoError(t, err)
+	sf.Stacks[0].Branches = append(sf.Stacks[0].Branches,
+		stack.BranchRef{Branch: "merged-unoccupied", PullRequest: &stack.PullRequestRef{Number: 4, Merged: true}},
+		stack.BranchRef{Branch: "merged-occupied", PullRequest: &stack.PullRequestRef{Number: 5, Merged: true}},
+	)
+	require.NoError(t, stack.Save(gitDir, sf))
+
+	withIssue250Repo(t, repo.b2Dir)
+	cfg := issue250TestConfig(t)
+	require.NoError(t, runSync(cfg, &syncOptions{remote: "origin", worktrees: true, prune: true}))
+
+	assert.Error(t, issue250GitMayFail(t, repo.cloneDir, "show-ref", "--verify", "--quiet", "refs/heads/merged-unoccupied"))
+	assert.Error(t, issue250GitMayFail(t, repo.cloneDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/merged-unoccupied"))
+	require.NoError(t, issue250GitMayFail(t, repo.cloneDir, "show-ref", "--verify", "--quiet", "refs/heads/merged-occupied"))
+	require.NoError(t, issue250GitMayFail(t, repo.cloneDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/merged-occupied"))
+	assert.Equal(t, "merged-occupied", issue250Git(t, occupiedDir, "branch", "--show-current"))
+}
+
+type syncWorktreeRepo struct {
+	remoteDir string
+	cloneDir  string
+	b1Dir     string
+	b2Dir     string
+	b3Dir     string
+}
+
+func setupSyncWorktreeRepo(t *testing.T, conflict bool) syncWorktreeRepo {
+	t.Helper()
+	repo := syncWorktreeRepo{
+		remoteDir: filepath.Join(t.TempDir(), "remote.git"),
+		cloneDir:  filepath.Join(t.TempDir(), "clone"),
+		b1Dir:     filepath.Join(t.TempDir(), "b1"),
+		b2Dir:     filepath.Join(t.TempDir(), "b2"),
+		b3Dir:     filepath.Join(t.TempDir(), "b3"),
+	}
+	upstreamDir := filepath.Join(t.TempDir(), "upstream")
+
+	issue250Git(t, ".", "-c", "safe.bareRepository=all", "init", "--bare", "-b", "main", repo.remoteDir)
+	issue250Git(t, ".", "clone", repo.remoteDir, repo.cloneDir)
+	issue250Git(t, repo.cloneDir, "config", "user.name", "Test")
+	issue250Git(t, repo.cloneDir, "config", "user.email", "test@example.com")
+	issue250WriteFile(t, repo.cloneDir, "shared.txt", "base\n")
+	issue250Git(t, repo.cloneDir, "add", ".")
+	issue250Git(t, repo.cloneDir, "commit", "-m", "base")
+	issue250Git(t, repo.cloneDir, "push", "-u", "origin", "main")
+	mainSHA := issue250Git(t, repo.cloneDir, "rev-parse", "main")
+
+	issue250Git(t, repo.cloneDir, "checkout", "-b", "b1")
+	issue250WriteFile(t, repo.cloneDir, "b1.txt", "b1\n")
+	issue250Git(t, repo.cloneDir, "add", ".")
+	issue250Git(t, repo.cloneDir, "commit", "-m", "b1")
+	b1SHA := issue250Git(t, repo.cloneDir, "rev-parse", "b1")
+	issue250Git(t, repo.cloneDir, "checkout", "-b", "b2")
+	if conflict {
+		issue250WriteFile(t, repo.cloneDir, "shared.txt", "b2\n")
+	} else {
+		issue250WriteFile(t, repo.cloneDir, "b2.txt", "b2\n")
+	}
+	issue250Git(t, repo.cloneDir, "add", ".")
+	issue250Git(t, repo.cloneDir, "commit", "-m", "b2")
+	b2SHA := issue250Git(t, repo.cloneDir, "rev-parse", "b2")
+	issue250Git(t, repo.cloneDir, "checkout", "-b", "b3")
+	issue250WriteFile(t, repo.cloneDir, "b3.txt", "b3\n")
+	issue250Git(t, repo.cloneDir, "add", ".")
+	issue250Git(t, repo.cloneDir, "commit", "-m", "b3")
+	b3SHA := issue250Git(t, repo.cloneDir, "rev-parse", "b3")
+	issue250Git(t, repo.cloneDir, "push", "-u", "origin", "b1", "b2", "b3")
+	writeStackFile(t, filepath.Join(repo.cloneDir, ".git"), stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main", Head: mainSHA},
+		Branches: []stack.BranchRef{
+			{Branch: "b1", Head: b1SHA, Base: mainSHA},
+			{Branch: "b2", Head: b2SHA, Base: b1SHA},
+			{Branch: "b3", Head: b3SHA, Base: b2SHA},
+		},
+	})
+	issue250Git(t, repo.cloneDir, "checkout", "main")
+	issue250Git(t, repo.cloneDir, "worktree", "add", repo.b1Dir, "b1")
+	issue250Git(t, repo.cloneDir, "worktree", "add", repo.b2Dir, "b2")
+	issue250Git(t, repo.cloneDir, "worktree", "add", repo.b3Dir, "b3")
+
+	issue250Git(t, ".", "clone", repo.remoteDir, upstreamDir)
+	issue250Git(t, upstreamDir, "config", "user.name", "Test")
+	issue250Git(t, upstreamDir, "config", "user.email", "test@example.com")
+	if conflict {
+		issue250WriteFile(t, upstreamDir, "shared.txt", "upstream\n")
+		issue250Git(t, upstreamDir, "add", "shared.txt")
+	} else {
+		issue250WriteFile(t, upstreamDir, "main.txt", "main\n")
+		issue250Git(t, upstreamDir, "add", "main.txt")
+	}
+	issue250Git(t, upstreamDir, "commit", "-m", "main update")
+	issue250Git(t, upstreamDir, "push", "origin", "main")
+	return repo
 }
 
 // TestSync_Prune_SkipsNonExistentBranches verifies that --prune does not

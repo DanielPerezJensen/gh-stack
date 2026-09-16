@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -55,6 +56,36 @@ func runSilent(args ...string) error {
 	return cmd.Run()
 }
 
+func runCurrent(args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// RequireRebaseNoUpdateRefs verifies that the installed Git supports the flag
+// used to prevent a rebase in one worktree from moving refs in another.
+func RequireRebaseNoUpdateRefs() error {
+	version, err := runCurrent("version")
+	if err != nil {
+		return fmt.Errorf("checking Git version for --worktrees: %w", err)
+	}
+	if supportsRebaseNoUpdateRefs(version) {
+		return nil
+	}
+	return fmt.Errorf("--worktrees requires Git 2.38 or newer because it needs git rebase --no-update-refs (found %s)", version)
+}
+
+func supportsRebaseNoUpdateRefs(version string) bool {
+	var major, minor int
+	if _, err := fmt.Sscanf(version, "git version %d.%d", &major, &minor); err != nil {
+		return false
+	}
+	return major > 2 || major == 2 && minor >= 38
+}
+
 // runInteractive runs a git command with stdin/stdout/stderr connected to
 // the terminal, allowing interactive programs like editors to work.
 func runInteractive(args ...string) error {
@@ -63,6 +94,16 @@ func runInteractive(args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func runAt(dir string, args ...string) (string, error) {
+	args = append([]string{"-C", dir}, args...)
+	return run(args...)
+}
+
+func runSilentAt(dir string, args ...string) error {
+	args = append([]string{"-C", dir}, args...)
+	return runSilent(args...)
 }
 
 // RebaseStartError indicates that git rejected a rebase before creating any
@@ -94,6 +135,21 @@ func runRebaseCommand(args []string, opts RebaseOpts) error {
 	}
 	err = tryAutoResolveRebase(err, opts)
 	if err != nil && !IsRebaseInProgress() {
+		return &RebaseStartError{Err: err}
+	}
+	return err
+}
+
+func runRebaseCommandAt(dir string, args []string, opts RebaseOpts) error {
+	if IsRebaseInProgressAt(dir) {
+		return &RebaseStartError{Err: errors.New("a rebase is already in progress")}
+	}
+	err := runSilentAt(dir, args...)
+	if err == nil {
+		return nil
+	}
+	err = tryAutoResolveRebaseAt(dir, err, opts)
+	if !IsRebaseInProgressAt(dir) {
 		return &RebaseStartError{Err: err}
 	}
 	return err
@@ -136,6 +192,25 @@ func tryAutoResolveRebase(originalErr error, opts RebaseOpts) error {
 		}
 		// Continue hit another conflicting commit; loop to check
 		// if rerere resolved that one too.
+	}
+	return originalErr
+}
+
+func tryAutoResolveRebaseAt(dir string, originalErr error, opts RebaseOpts) error {
+	for i := 0; i < 1000; i++ {
+		if !IsRebaseInProgressAt(dir) {
+			if i == 0 {
+				return originalErr
+			}
+			return nil
+		}
+		conflicts, err := ConflictedFilesAt(dir)
+		if err != nil || len(conflicts) > 0 {
+			return originalErr
+		}
+		if rebaseContinueOnceAt(dir, opts) == nil {
+			return nil
+		}
 	}
 	return originalErr
 }
@@ -212,6 +287,75 @@ func Rebase(base string, opts RebaseOpts) error {
 	return ops.Rebase(base, opts)
 }
 
+// CommonDir returns the repository directory shared by all linked worktrees.
+func CommonDir() (string, error) {
+	dir, err := runCurrent("rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(dir)
+}
+
+// Worktrees returns checked-out branches mapped to their worktree paths.
+func Worktrees() (map[string]string, error) {
+	out, err := runCurrent("worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	worktrees := map[string]string{}
+	var path string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			path = strings.TrimPrefix(line, "worktree ")
+			continue
+		}
+		if strings.HasPrefix(line, "branch refs/heads/") && path != "" {
+			worktrees[strings.TrimPrefix(line, "branch refs/heads/")] = path
+		}
+		if line == "" {
+			path = ""
+		}
+	}
+	return worktrees, nil
+}
+
+// UsingDefaultOps reports whether commands use the production git backend.
+// Unit tests replace Ops and must not invoke process-based worktree discovery.
+func UsingDefaultOps() bool {
+	_, ok := ops.(*defaultOps)
+	return ok
+}
+
+// WorktreePath returns the path containing the current checkout.
+func WorktreePath() (string, error) {
+	return runCurrent("rev-parse", "--show-toplevel")
+}
+
+// RebaseAt rebases the branch currently checked out in dir.
+func RebaseAt(dir, base string, opts RebaseOpts) error {
+	args := []string{"rebase"}
+	if opts.CommitterDateIsAuthorDate {
+		args = append(args, "--committer-date-is-author-date")
+	}
+	if opts.NoUpdateRefs {
+		args = append(args, "--no-update-refs")
+	}
+	return runRebaseCommandAt(dir, append(args, base), opts)
+}
+
+// RebaseOntoAt rebases the branch currently checked out in dir using --onto.
+func RebaseOntoAt(dir, newBase, oldBase string, opts RebaseOpts) error {
+	args := []string{"rebase"}
+	if opts.CommitterDateIsAuthorDate {
+		args = append(args, "--committer-date-is-author-date")
+	}
+	if opts.NoUpdateRefs {
+		args = append(args, "--no-update-refs")
+	}
+	args = append(args, "--onto", newBase, oldBase)
+	return runRebaseCommandAt(dir, args, opts)
+}
+
 // EnableRerere enables git rerere (reuse recorded resolution) and
 // rerere.autoupdate (auto-stage resolved files) for the repository.
 func EnableRerere() error {
@@ -275,6 +419,86 @@ func RebaseContinue(opts RebaseOpts) error {
 func RebaseAbort() error {
 	return ops.RebaseAbort()
 }
+
+func RebaseContinueAt(dir string, opts RebaseOpts) error {
+	err := rebaseContinueOnceAt(dir, opts)
+	if err == nil {
+		return nil
+	}
+	return tryAutoResolveRebaseAt(dir, err, opts)
+}
+
+func rebaseContinueOnceAt(dir string, opts RebaseOpts) error {
+	args := []string{"rebase"}
+	if opts.CommitterDateIsAuthorDate {
+		args = append(args, "--committer-date-is-author-date")
+	}
+	args = append(args, "--continue")
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_EDITOR=true")
+	return cmd.Run()
+}
+
+func RebaseAbortAt(dir string) error { return runSilentAt(dir, "rebase", "--abort") }
+
+func IsRebaseInProgressAt(dir string) bool {
+	gitDir, err := runAt(dir, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return false
+	}
+	for _, name := range []string{"rebase-merge", "rebase-apply"} {
+		if info, err := os.Stat(filepath.Join(gitDir, name)); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+// WorktreeBusy reports state that would make it unsafe to rebase in dir.
+func WorktreeBusy(dir string) (string, error) {
+	if IsRebaseInProgressAt(dir) {
+		return "a rebase is already in progress", nil
+	}
+	gitDir, err := runAt(dir, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return "", err
+	}
+	for _, name := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"} {
+		if _, err := os.Stat(filepath.Join(gitDir, name)); err == nil {
+			return strings.ToLower(strings.TrimSuffix(name, "_HEAD")) + " is in progress", nil
+		}
+	}
+	status, err := runAt(dir, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	if status != "" {
+		return "it has staged, unstaged, or untracked changes", nil
+	}
+	return "", nil
+}
+
+func ConflictedFilesAt(dir string) ([]string, error) {
+	out, err := runAt(dir, "diff", "--name-only", "--diff-filter=U")
+	if err != nil || out == "" {
+		return nil, err
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+// FindConflictMarkersAt scans conflict markers in a file relative to dir.
+func FindConflictMarkersAt(dir, filePath string) (*ConflictMarkerInfo, error) {
+	output, err := runAt(dir, "diff", "--check", "--", filePath)
+	if output == "" && err != nil {
+		return nil, err
+	}
+	return parseConflictMarkers(filePath, output), nil
+}
+
+func ResetHardAt(dir, ref string) error { return runSilentAt(dir, "reset", "--hard", ref) }
+
+// MergeFFAt fast-forwards the branch checked out in dir.
+func MergeFFAt(dir, ref string) error { return runSilentAt(dir, "merge", "--ff-only", ref) }
 
 // IsRebaseInProgress checks whether a rebase is currently in progress.
 func IsRebaseInProgress() bool {
