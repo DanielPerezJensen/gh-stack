@@ -96,11 +96,38 @@ verbatim — `gh stack add refactor/foo` creates `refactor/foo`.
 ```bash
 gh stack sync                   # fetch, reconcile with GitHub, rebase, push, refresh PR state
 gh stack sync --prune           # also delete local branches for merged PRs
+gh stack rebase --worktrees     # rebase branches checked out in linked worktrees
+gh stack sync --worktrees       # sync branches checked out in linked worktrees
 ```
 
 Pruning never happens without `--prune` when non-interactive. If the local and remote stacks have
 diverged, `sync` prints both chains, makes no changes, and exits 0 with `Sync aborted` — see
 `references/troubleshooting.md`.
+
+## Linked Worktrees
+
+Use `-w` or `--worktrees` when a stack branch is checked out in a linked Git worktree. The local
+extension requires Git 2.38 or newer in this mode.
+
+```bash
+# Rebase the selected stack range in each branch's owning worktree
+gh stack rebase --worktrees
+
+# Fetch, rebase, push, and sync the stack across its owning worktrees
+gh stack sync --worktrees
+```
+
+- `rebase --worktrees` and `sync --worktrees` preflight every participating worktree. Staged,
+  unstaged, untracked changes, and in-progress Git operations stop the command before branch refs
+  or files change. Keep participating worktrees exclusively available while the command runs.
+- Without `--worktrees`, these commands stop with guidance before changing a selected branch that
+  is checked out in another worktree.
+- A rebase conflict remains in the owning worktree. Resolve and stage it there, then run
+  `gh stack rebase --continue` or `gh stack rebase --abort` from any worktree in the repository.
+- A sync conflict is aborted and its cascade changes are restored. Run
+  `gh stack rebase --worktrees` to resolve it, then retry `gh stack sync --worktrees`.
+- `sync --worktrees --prune` skips merged branches that are checked out in any worktree. It does
+  not remove or relocate worktrees.
 
 ## Merging
 
