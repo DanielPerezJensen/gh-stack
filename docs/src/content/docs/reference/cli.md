@@ -312,6 +312,7 @@ gh stack sync [flags]
 |------|-------------|
 | `--remote <name>` | Remote to fetch from and push to (defaults to auto-detected remote) |
 | `--prune` | Delete local branches for merged PRs |
+| `-w`, `--worktrees` | Sync checked-out branches in their linked worktrees |
 
 Performs a synchronization of the entire stack:
 
@@ -325,6 +326,12 @@ Performs a synchronization of the entire stack:
 8. **Prune** — in interactive terminals, prompts to delete local branches for merged PRs. Use `--prune` to prune automatically.
 
 A clean remote-ahead update (PRs added on top of your local stack) is pulled down automatically without prompting, so `sync` is safe to run in automation. Sync only prompts when the stacks have truly diverged.
+
+When stack branches are checked out in linked worktrees, use `sync --worktrees` (or `sync -w`). It preflights participating worktrees for uncommitted changes and active Git operations, fast-forwards and rebases each checked-out branch in its owner, and requires Git 2.38 or newer. Worktrees must remain exclusively available during the operation. Without the flag, sync stops with guidance before it would modify a branch checked out in another worktree.
+
+If a worktree sync conflicts, it aborts the rebase and restores cascade-rebased branches to their pre-cascade state; preliminary fast-forwards are retained. Resolve the conflict with `gh stack rebase --worktrees`, then run `gh stack sync --worktrees` again. Sync has no `--continue` or `--abort` modes.
+
+With `sync --worktrees --prune`, merged branches checked out in any worktree are skipped and reported. Unoccupied merged branches are pruned normally.
 
 **Diverged stacks**
 
@@ -343,6 +350,9 @@ gh stack sync
 
 # Sync and automatically prune merged branches
 gh stack sync --prune
+
+# Sync branches checked out in linked worktrees
+gh stack sync --worktrees
 ```
 
 ### `gh stack rebase`

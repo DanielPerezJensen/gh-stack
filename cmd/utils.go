@@ -220,6 +220,13 @@ func loadStackOptional(cfg *config.Config, branch string) (*loadStackResult, err
 		cfg.Errorf("not a git repository")
 		return nil, fmt.Errorf("not a git repository")
 	}
+	if git.UsingDefaultOps() {
+		gitDir, err = git.CommonDir()
+		if err != nil {
+			cfg.Errorf("failed to find shared git directory: %s", err)
+			return nil, fmt.Errorf("failed to find shared git directory: %w", err)
+		}
+	}
 
 	sf, err := stack.Load(gitDir)
 	if err != nil {
