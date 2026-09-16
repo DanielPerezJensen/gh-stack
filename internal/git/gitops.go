@@ -15,6 +15,7 @@ import (
 // RebaseOpts holds optional parameters for git rebase operations.
 type RebaseOpts struct {
 	CommitterDateIsAuthorDate bool
+	NoUpdateRefs              bool
 }
 
 // ErrRemoteBranchNotFound indicates that a requested branch does not exist on
@@ -274,6 +275,9 @@ func (d *defaultOps) Rebase(base string, opts RebaseOpts) error {
 	if opts.CommitterDateIsAuthorDate {
 		args = append(args, "--committer-date-is-author-date")
 	}
+	if opts.NoUpdateRefs {
+		args = append(args, "--no-update-refs")
+	}
 	args = append(args, base)
 	return runRebaseCommand(args, opts)
 }
@@ -327,6 +331,9 @@ func (d *defaultOps) RebaseOnto(newBase, oldBase, branch string, opts RebaseOpts
 	if opts.CommitterDateIsAuthorDate {
 		args = append(args, "--committer-date-is-author-date")
 	}
+	if opts.NoUpdateRefs {
+		args = append(args, "--no-update-refs")
+	}
 	args = append(args, "--onto", newBase, oldBase, branch)
 	return runRebaseCommand(args, opts)
 }
@@ -374,6 +381,10 @@ func (d *defaultOps) FindConflictMarkers(filePath string) (*ConflictMarkerInfo, 
 		return nil, err
 	}
 
+	return parseConflictMarkers(filePath, output), nil
+}
+
+func parseConflictMarkers(filePath, output string) *ConflictMarkerInfo {
 	info := &ConflictMarkerInfo{File: filePath}
 	var currentSection *ConflictSection
 
@@ -400,7 +411,7 @@ func (d *defaultOps) FindConflictMarkers(filePath string) (*ConflictMarkerInfo, 
 		}
 	}
 
-	return info, nil
+	return info
 }
 
 func (d *defaultOps) IsAncestor(ancestor, descendant string) (bool, error) {
